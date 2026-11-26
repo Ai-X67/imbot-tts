@@ -9,16 +9,16 @@ VOICES = {
     "nabanita": "bn-BD-NabanitaNeural",
 }
 
-@app.get("/")
-async def home():
-    return {"status": "IMBOT Edge TTS Server Running!"}
-
-@app.get("/tts")
-async def tts(
-    text: str = Query(..., min_length=1, max_length=300),
+@app.get("/{full_path:path}")
+async def handle_all(
+    full_path: str,
+    text: str = Query(None, max_length=300),
     voice: str = Query("pradeep"),
     rate: str = Query("+5%")
 ):
+    if not text:
+        return {"status": "IMBOT Edge TTS Server Running!"}
+
     v = VOICES.get(voice.lower(), "bn-BD-PradeepNeural")
     communicate = edge_tts.Communicate(text=text, voice=v, rate=rate)
     audio_data = bytearray()
