@@ -1,4 +1,4 @@
-// IMBOT Cloud Engine — 16kHz u-Law Studio Audio + Whisper V3 + 2026 Smart Search + Dual AI
+// IMBOT Cloud Engine v2.2 — 16kHz u-Law + Multi-Model Gemini/Groq Fallback + 2026 Smart Search
 
 const parseKeys = (headerVal) =>
   String(headerVal || '')
@@ -41,7 +41,6 @@ async function readRawBody(req, isAudio) {
   });
 }
 
-// G.711 u-Law -> 16-bit Linear PCM + স্মার্ট RMS অডিও নরমালাইজেশন
 function muLawToLinear(uVal) {
   uVal = (~uVal) & 0xFF;
   const sign = uVal & 0x80;
@@ -65,7 +64,6 @@ function normalizeToCleanPcmWav(rawBuf) {
 
   let samples;
   if (audioFormat === 7) {
-    // 16kHz u-Law (1 byte/sample) -> 16-bit PCM
     samples = new Int16Array(payloadLen);
     for (let i = 0; i < payloadLen; i++) {
       samples[i] = muLawToLinear(rawBuf[dataOffset + i]);
@@ -80,7 +78,6 @@ function normalizeToCleanPcmWav(rawBuf) {
     return rawBuf;
   }
 
-  // প্রথম ৫০ms এর টাচ-ক্লিক বাদ দিয়ে RMS বের করা (যাতে ভয়েস চাপা না পড়ে)
   const skip = Math.min(samples.length, Math.floor(sampleRate * 0.05));
   let sumSq = 0;
   let activeCnt = 0;
@@ -99,7 +96,6 @@ function normalizeToCleanPcmWav(rawBuf) {
       if (gain > 8.0) gain = 8.0;
       if (gain < 0.7) gain = 0.7;
       for (let i = 0; i < samples.length; i++) {
-        // সফট লিমিটার (ক্লিপিং ছাড়াই স্পষ্ট ভয়েস)
         const scaled = (samples[i] * gain) / 30000;
         const soft = Math.tanh(scaled) * 30000;
         samples[i] = Math.max(-32767, Math.min(32767, Math.round(soft)));
@@ -128,12 +124,13 @@ function normalizeToCleanPcmWav(rawBuf) {
   return out;
 }
 
-// ১. Groq Whisper Large V3 (বাংলার জন্য সর্বোচ্চ অ্যাকুরেট)
+// ১. Groq Whisper (বাংলা STT)
 async function transcribeWithGroq(cleanWavBuf, groqKeys) {
   const groq429 = [];
   const models = ['whisper-large-v3', 'whisper-large-v3-turbo'];
 
   for (let i = 0; i < groqKeys.length; i++) {
+    let hit429 = 0;
     for (const model of models) {
       try {
         const form = new FormData();
@@ -143,19 +140,19 @@ async function transcribeWithGroq(cleanWavBuf, groqKeys) {
         form.append('temperature', '0');
         form.append(
           'prompt',
-          'ইমবট, আল ইমরান, অ্যালার্ম, টাইমার, ফোকাস, গেম, টিক ট্যাক টো, রক পেপার সিজার, ডাইনো, ফ্ল্যাপি, কয়েন টস, ভলিউম, আবহাওয়া, সময়, বর্তমান প্রধানমন্ত্রী, তারেক রহমান, আইফোন ১৭ প্রো ম্যাক্স, ঢাকা, বাংলাদেশ।'
+          'ইমবট, আল ইমরান, অ্যালার্ম, টাইমার, ফোকাস, গেম, টিক ট্যাক টো, রক পেপার সিজার, ডাইনো, ফ্ল্যাপি, কয়েন টস, ভলিউম, আবহাওয়া, সময়, বর্তমান প্রধানমন্ত্রী, তারেক রহমান, আইফোন ১৭ প্রো ম্যাক্স, বাংলাদেশের দাম কত, ঢাকা, বাংলাদেশ।'
         );
 
         const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
           method: 'POST',
           headers: { Authorization: `Bearer ${groqKeys[i]}` },
           body: form,
-          signal: AbortSignal.timeout(8500)
+          signal: AbortSignal.timeout(7000)
         });
 
         if (resp.status === 429) {
-          if (!groq429.includes(i)) groq429.push(i);
-          break;
+          hit429++;
+          continue;
         }
         if (!resp.ok) continue;
 
@@ -168,6 +165,7 @@ async function transcribeWithGroq(cleanWavBuf, groqKeys) {
         continue;
       }
     }
+    if (hit429 === models.length) groq429.push(i);
   }
   return { text: '', groqIdx: -1, groq429 };
 }
@@ -179,11 +177,11 @@ function needsLiveSearch(text) {
   const skipLocal = /(অ্যালার্ম|এলার্ম|alarm|টাইমার|timer|ফোকাস|focus|ভলিউম|সাউন্ড|volume|গেম|game|টিক ট্যাক|রক পেপার|ডাইনো|ফ্ল্যাপি|কয়েন|কয়েন|ঘুমা|sleep|ইন্ট্রো|intro|তোমার নাম|কে বানিয়েছে|বানাইছে|নির্মাতা|মেকার|ধাঁধা|গল্প|জোকস|কৌতুক)/i;
   if (skipLocal.test(t)) return false;
 
-  const liveTriggers = /(আজ|আজকে|এখন|বর্তমান|সর্বশেষ|লেটেস্ট|নিউজ|খবর|দাম|প্রাইস|টাকা|প্রধানমন্ত্রী|রাষ্ট্রপতি|উপদেষ্টা|সরকার|নির্বাচন|খেলা|ম্যাচ|স্কোর|ক্রিকেট|ফুটবল|বিশ্বকাপ|আইফোন|iphone|samsung|ডলার|সোনা|স্বর্ণ|বাজারে|নতুন|আপডেট|মারা|বেঁচে|বাজেট|2025|2026|2027|১৭|17|price|latest|news|current|today|now|prime minister|president|score|match|winner|who is)/i;
+  const liveTriggers = /(আজ|আজকে|এখন|বর্তমান|বত্তমান|সর্বশেষ|লেটেস্ট|নিউজ|খবর|দাম|হিদাম|প্রাইস|টাকা|প্রধানমন্ত্রী|রাষ্ট্রপতি|উপদেষ্টা|সরকার|নির্বাচন|খেলা|ম্যাচ|স্কোর|ক্রিকেট|ফুটবল|বিশ্বকাপ|আইফোন|iphone|samsung|ডলার|সোনা|স্বর্ণ|বাজারে|নতুন|আপডেট|মারা|বেঁচে|বাজেট|2025|2026|2027|১৭|17|price|latest|news|current|today|now|prime minister|president|score|match|winner|who is)/i;
   return liveTriggers.test(t);
 }
 
-// ৩. বাংলা প্রশ্ন -> ২০২৬-টার্গেটেড ইংরেজি সার্চ কোয়েরি (~150ms)
+// ৩. বাংলা প্রশ্ন (ফোনেটিক টাইপোসহ) -> ২০২৬ ইংরেজি সার্চ কোয়েরি
 async function build2026SearchQuery(userText, timeInfo, groqKeys, existing429) {
   for (let i = 0; i < groqKeys.length; i++) {
     if (existing429.includes(i)) continue;
@@ -199,7 +197,7 @@ async function build2026SearchQuery(userText, timeInfo, groqKeys, existing429) {
           messages: [
             {
               role: 'system',
-              content: `Today is ${timeInfo.dateStr} (year ${timeInfo.year}). Convert the user's question into ONE short English web search query (max 8 words) including "${timeInfo.year}" to get the latest current fact. For Bangladesh topics include "Bangladesh". Output ONLY the query text.`
+              content: `Today is ${timeInfo.dateStr} (year ${timeInfo.year}). Input is noisy Bangla speech-to-text (may have phonetic typos like "রহমাক্স"=Pro Max, "হিদাম"=দাম/price, "বত্তমানে"=বর্তমানে). Infer the real question and output ONLY ONE short English web search query (max 8 words) including "${timeInfo.year}". Include "Bangladesh" if relevant.`
             },
             { role: 'user', content: userText }
           ],
@@ -234,10 +232,10 @@ async function runLiveSearch(searchQuery, rawBangla, timeInfo, tavilyKeys) {
           api_key: tavilyKeys[i],
           query: searchQuery,
           search_depth: 'basic',
-          max_results: 5,
+          max_results: 4,
           include_answer: true
         }),
-        signal: AbortSignal.timeout(5000)
+        signal: AbortSignal.timeout(4500)
       });
 
       if (resp.status === 429 || resp.status === 432) {
@@ -247,14 +245,14 @@ async function runLiveSearch(searchQuery, rawBangla, timeInfo, tavilyKeys) {
       if (!resp.ok) continue;
 
       const data = await resp.json();
-      let summary = `Search Query Used: ${searchQuery}\n`;
+      let summary = `Search Query: ${searchQuery}\n`;
       if (data.answer) summary += `Direct Answer (${timeInfo.year}): ${data.answer}\n`;
       if (Array.isArray(data.results)) {
-        for (const r of data.results.slice(0, 4)) {
-          summary += `- ${r.title}: ${String(r.content || '').slice(0, 260)}\n`;
+        for (const r of data.results.slice(0, 3)) {
+          summary += `- ${r.title}: ${String(r.content || '').slice(0, 220)}\n`;
         }
       }
-      if (summary.length > 40) {
+      if (summary.length > 35) {
         return { context: summary.trim(), source: 'tavily', tavIdx: i, tav429 };
       }
     } catch (_) {
@@ -262,7 +260,6 @@ async function runLiveSearch(searchQuery, rawBangla, timeInfo, tavilyKeys) {
     }
   }
 
-  // ফ্রি আনলিমিটেড ব্যাকআপ: Google News RSS (ইংরেজি ২০২৬ + বাংলা)
   try {
     const rssUrls = [
       `https://news.google.com/rss/search?q=${encodeURIComponent(searchQuery + ' when:90d')}&hl=en-US&gl=BD&ceid=BD:en`,
@@ -271,13 +268,13 @@ async function runLiveSearch(searchQuery, rawBangla, timeInfo, tavilyKeys) {
     for (const url of rssUrls) {
       const resp = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(4000)
+        signal: AbortSignal.timeout(3500)
       });
       if (!resp.ok) continue;
       const xml = await resp.text();
       const items = [...xml.matchAll(/<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>[\s\S]*?<pubDate>([\s\S]*?)<\/pubDate>[\s\S]*?<\/item>/g)];
       if (items.length > 0) {
-        const lines = items.slice(0, 6).map((m) => {
+        const lines = items.slice(0, 5).map((m) => {
           const title = m[1].replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
           const pub = m[2].trim();
           return `- ${title} (${pub})`;
@@ -297,13 +294,14 @@ function buildSystemPrompt(timeInfo, status, searchContext) {
 IDENTITY & TONE RULES:
 1) Your name is ইমবট (IMBOT). If asked who made/built/created you, answer: আমাকে আল ইমরান বানিয়েছেন।
 2) Always speak in natural, friendly, conversational Bangla using "তুমি / বলো". NEVER use formal "আপনি / বলুন" and NEVER use the words "বাডি" or "বন্ধু".
-3) Be accurate and direct for commands and factual questions. For stories, riddles (ধাঁধা), or jokes, be lively and complete them fully.
-4) Never output markdown symbols (*, #, **, backticks). Output plain clean Bangla speech text after the tag.
-5) Current Dhaka Date & Time: ${timeInfo.full}. Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}, Current Year=${timeInfo.year}.
-6) Device Status: City=${status.city}, Weather=${status.weather}, Battery=${status.bat}, Volume=${status.vol}%.
-${searchContext ? `\nCRITICAL LIVE WEB SEARCH RESULTS (${timeInfo.year}):\nYour pre-training knowledge is outdated (before ${timeInfo.year}). You MUST strictly trust and state the latest ${timeInfo.year} facts from these search results (for example, current elected Prime Minister, latest phone prices, current news) and NEVER repeat outdated 2024/2025 facts that contradict these results:\n${searchContext}\n` : ''}
+3) User input may come from Bangla speech-to-text with minor phonetic typos (e.g. "আসকে তারিক"=আজকে তারিখ, "রহমাক্সের হিদাম"=প্রো ম্যাক্সের দাম). Understand the intended meaning seamlessly without mentioning typos.
+4) Be accurate and direct for commands and factual questions. For stories, riddles (ধাঁধা), or jokes, be lively and complete them fully.
+5) Never output markdown symbols (*, #, **, backticks). Output plain clean Bangla speech text after the tag.
+6) Current Dhaka Date & Time: ${timeInfo.full}. Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}, Current Year=${timeInfo.year}.
+7) Device Status: City=${status.city}, Weather=${status.weather}, Battery=${status.bat}, Volume=${status.vol}%.
+${searchContext ? `\nCRITICAL LIVE WEB SEARCH RESULTS (${timeInfo.year}):\nTrust these ${timeInfo.year} live results over any older knowledge. State the latest ${timeInfo.year} facts clearly in Bangla:\n${searchContext}\n` : ''}
 COMMAND TAGS (Put the EXACT tag at the very start ONLY when the user gives a command, followed by a brief 3-7 word friendly Bangla confirmation):
-- [ACT:ALARM:YYYY-MM-DD:HH:MM:ONCE] set one-time alarm on specific date (24h HH:MM). Use Today=${timeInfo.dateStr} for আজ/আজকে, Tomorrow=${timeInfo.tomorrowStr} for কাল/কালকে, or exact date for "৩০ তারিখ". সকাল=AM, দুপুর/বিকাল/সন্ধ্যা/রাত=PM (রাত ১২টা=00:00).
+- [ACT:ALARM:YYYY-MM-DD:HH:MM:ONCE] set one-time alarm on specific date (24h HH:MM). Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}. সকাল=AM, দুপুর/বিকাল/সন্ধ্যা/রাত=PM (রাত ১২টা=00:00).
 - [ACT:ALARM:DAILY:HH:MM:DAILY] set repeating daily alarm ONLY if user says প্রতিদিন/রোজ/daily.
 - [ACT:ALARM:OFF] cancel all alarms.
 - [ACT:ALARM:DEL:HH:MM] delete a specific alarm time.
@@ -318,12 +316,14 @@ COMMAND TAGS (Put the EXACT tag at the very start ONLY when the user gives a com
 If NOT a command, start with ONE matching emotion tag: [HAPPY], [LAUGH], [LOVE], [SHY], [WINK], [AMAZED], [SHOCKED], [CONFUSED], [ANGRY], [SAD], [COOL], [HOT], [SHIVER], or [DIZZY], then give the Bangla answer directly.`;
 }
 
-// ৬. Gemini API
+// ৬. Gemini API (বেশি কোটার lite প্রথমে, ৪২৯ এলে পরের মডেল স্কিপ করবে না)
 async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
   const gem429 = [];
-  const models = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+  const models = ['gemini-flash-lite-latest', 'gemini-flash-latest'];
+  let lastErr = 'ok';
 
   for (let i = 0; i < geminiKeys.length; i++) {
+    let hit429 = 0;
     for (const model of models) {
       try {
         const parts = wavBuffer
@@ -342,15 +342,19 @@ async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
               contents: [{ parts }],
               generationConfig: { maxOutputTokens: 900, temperature: 0.3 }
             }),
-            signal: AbortSignal.timeout(8500)
+            signal: AbortSignal.timeout(6500)
           }
         );
 
         if (resp.status === 429) {
-          if (!gem429.includes(i)) gem429.push(i);
-          break;
+          hit429++;
+          lastErr = '429';
+          continue; // একই কী-তে পরের Gemini মডেল ট্রাই করো
         }
-        if (!resp.ok) continue;
+        if (!resp.ok) {
+          lastErr = String(resp.status);
+          continue;
+        }
 
         const data = await resp.json();
         const text = (data?.candidates?.[0]?.content?.parts || [])
@@ -359,56 +363,71 @@ async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
           .replace(/\s+/g, ' ')
           .trim();
 
-        if (text) return { reply: text, gemIdx: i, gem429 };
+        if (text) return { reply: text, gemIdx: i, gem429, lastErr: 'ok' };
       } catch (_) {
+        lastErr = 'to';
         continue;
       }
     }
+    if (hit429 === models.length) gem429.push(i);
   }
-  return { reply: '', gemIdx: -1, gem429 };
+  return { reply: '', gemIdx: -1, gem429, lastErr };
 }
 
-// ৭. Groq Llama 3.3 70B ব্যাকআপ AI
+// ৭. Groq Multi-Model ব্যাকআপ AI (৩টা মডেল অটো ফলব্যাক)
 async function askGroqLLM(sysPrompt, userText, groqKeys, existing429) {
   const groq429 = [...existing429];
+  const models = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b'];
+  let lastErr = 'ok';
+
   for (let i = 0; i < groqKeys.length; i++) {
     if (groq429.includes(i)) continue;
-    try {
-      const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${groqKeys[i]}`
-        },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            { role: 'system', content: sysPrompt },
-            { role: 'user', content: userText }
-          ],
-          max_tokens: 900,
-          temperature: 0.3
-        }),
-        signal: AbortSignal.timeout(8000)
-      });
+    let hit429 = 0;
 
-      if (resp.status === 429) {
-        groq429.push(i);
+    for (const model of models) {
+      try {
+        const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${groqKeys[i]}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: sysPrompt },
+              { role: 'user', content: userText }
+            ],
+            max_tokens: 900,
+            temperature: 0.3
+          }),
+          signal: AbortSignal.timeout(6000)
+        });
+
+        if (resp.status === 429) {
+          hit429++;
+          lastErr = '429';
+          continue;
+        }
+        if (!resp.ok) {
+          lastErr = String(resp.status);
+          continue;
+        }
+
+        const data = await resp.json();
+        const text = String(data?.choices?.[0]?.message?.content || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (text) return { reply: text, groqIdx: i, groq429, lastErr: 'ok' };
+      } catch (_) {
+        lastErr = 'to';
         continue;
       }
-      if (!resp.ok) continue;
-
-      const data = await resp.json();
-      const text = String(data?.choices?.[0]?.message?.content || '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (text) return { reply: text, groqIdx: i, groq429 };
-    } catch (_) {
-      continue;
     }
+    if (hit429 === models.length) groq429.push(i);
   }
-  return { reply: '', groqIdx: -1, groq429 };
+  return { reply: '', groqIdx: -1, groq429, lastErr };
 }
 
 async function handler(req, res) {
@@ -425,7 +444,7 @@ async function handler(req, res) {
       JSON.stringify({
         ok: true,
         status: 'IMBOT Online',
-        version: '2.1',
+        version: '2.2',
         dhaka_time: timeInfo.full
       })
     );
@@ -487,7 +506,6 @@ async function handler(req, res) {
       userText = rawBody.toString('utf8').trim();
     }
 
-    // লাইভ ওয়েব সার্চ (২০২৬ কোয়েরি রিরাইটসহ)
     let searchRes = { context: '', source: 'none', tavIdx: -1, tav429: [] };
     if (userText && needsLiveSearch(userText)) {
       const smartQuery = await build2026SearchQuery(userText, timeInfo, groqKeys, groq429);
@@ -501,12 +519,15 @@ async function handler(req, res) {
     let gemIdx = -1;
     let gem429 = [];
     let finalGroqIdx = sttGroqIdx;
+    let gErr = 'no-key';
+    let qErr = 'no-key';
 
     if (geminiKeys.length > 0) {
       const g = await askGemini(sysPrompt, userText, fallbackWav, geminiKeys);
       reply = g.reply;
       gemIdx = g.gemIdx;
       gem429 = g.gem429;
+      gErr = g.lastErr;
       if (reply) engine = 'gemini';
     }
 
@@ -515,16 +536,18 @@ async function handler(req, res) {
       reply = q.reply;
       if (q.groqIdx !== -1) finalGroqIdx = q.groqIdx;
       groq429 = q.groq429;
+      qErr = q.lastErr;
       if (reply) engine = 'groq';
     }
 
     if (!reply) {
-      reply = '[SAD] এপিআই কী-এর লিমিট শেষ বা সার্ভার ব্যস্ত, ওয়েব হাবে নতুন কী দাও।';
+      engine = `err(g:${gErr},q:${qErr})`;
+      reply = '[SAD] এপিআই কী-এর লিমিট শেষ বা সার্ভার ব্যস্ত, আরেকবার চেষ্টা করো।';
     }
 
     return res.status(200).send(
       JSON.stringify({
-        ok: engine !== 'none',
+        ok: engine === 'gemini' || engine === 'groq',
         transcript: userText,
         reply,
         engine,
