@@ -1,0 +1,419 @@
+// IMBOT Cloud Brain v2.0 — Groq Whisper + Tavily/RSS Live Search + Dual AI (Gemini + Groq)
+
+const parseKeys = (headerVal) =>
+  String(headerVal || '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter((k) => k.length > 8);
+
+function getDhakaTimeInfo() {
+  const now = new Date();
+  const dhakaMs = now.getTime() + 6 * 60 * 60 * 1000;
+  const d = new Date(dhakaMs);
+  const pad = (n) => String(n).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  const mm = pad(d.getUTCMonth() + 1);
+  const dd = pad(d.getUTCDate());
+  const hh = pad(d.getUTCHours());
+  const min = pad(d.getUTCMinutes());
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const tomorrow = new Date(dhakaMs + 24 * 60 * 60 * 1000);
+  const tomStr = `${tomorrow.getUTCFullYear()}-${pad(tomorrow.getUTCMonth() + 1)}-${pad(tomorrow.getUTCDate())}`;
+  return {
+    dateStr: `${yyyy}-${mm}-${dd}`,
+    tomorrowStr: tomStr,
+    time24: `${hh}:${min}`,
+    dayName: days[d.getUTCDay()],
+    full: `${days[d.getUTCDay()]}, ${yyyy}-${mm}-${dd} ${hh}:${min} (Dhaka Time, UTC+6)`
+  };
+}
+
+async function readRawBody(req) {
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === 'string') return Buffer.from(req.body, 'utf8');
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// ১. Groq Whisper Large V3 Turbo (যেকোনো বাংলা অ্যাকসেন্ট ৯৮% একুরেট)
+async function transcribeWithGroq(wavBuffer, groqKeys) {
+  const groq429 = [];
+  for (let i = 0; i < groqKeys.length; i++) {
+    try {
+      const form = new FormData();
+      form.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
+      form.append('model', 'whisper-large-v3-turbo');
+      form.append('language', 'bn');
+      form.append('temperature', '0');
+      form.append(
+        'prompt',
+        'ইমবট, আল ইমরান, অ্যালার্ম, টাইমার, ফোকাস, গেম, টিক ট্যাক টো, রক পেপার সিজার, ডাইনো, ফ্ল্যাপি, কয়েন টস, ভলিউম, আবহাওয়া, সময়, তারেক রহমান, আইফোন ১৭ প্রো ম্যাক্স, ঢাকা, বাংলাদেশ।'
+      );
+
+      const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${groqKeys[i]}` },
+        body: form,
+        signal: AbortSignal.timeout(8000)
+      });
+
+      if (resp.status === 429) {
+        groq429.push(i);
+        continue;
+      }
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+      const text = (data && data.text ? String(data.text) : '').trim();
+      return { text, groqIdx: i, groq429 };
+    } catch (_) {
+      continue;
+    }
+  }
+  return { text: '', groqIdx: -1, groq429 };
+}
+
+// ২. স্মার্ট লাইভ সার্চ ডিটেক্টর (অযথা কোটা খরচ করবে না)
+function needsLiveSearch(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  const skipLocal = /(অ্যালার্ম|এলার্ম|alarm|টাইমার|timer|ফোকাস|focus|ভলিউম|সাউন্ড|volume|গেম|game|টিক ট্যাক|রক পেপার|ডাইনো|ফ্ল্যাপি|কয়েন|কয়েন|ঘুমা|sleep|ইন্ট্রো|intro|তোমার নাম|কে বানিয়েছে|বানাইছে|নির্মাতা|মেকার|ধাঁধা|গল্প|জোকস|কৌতুক)/i;
+  if (skipLocal.test(t)) return false;
+
+  const liveTriggers = /(আজ|আজকে|এখন|বর্তমান|সর্বশেষ|লেটেস্ট|নিউজ|খবর|দাম|প্রাইস|টাকা|প্রধানমন্ত্রী|রাষ্ট্রপতি|উপদেষ্টা|সরকার|নির্বাচন|খেলা|ম্যাচ|স্কোর|ক্রিকেট|ফুটবল|আইফোন|iphone|samsung|ডলার|সোনা|স্বর্ণ|বাজারে|নতুন|আপডেট|2025|2026|2027|১৭|17|price|latest|news|current|today|now|prime minister|president|score|match|winner|who is)/i;
+  return liveTriggers.test(t);
+}
+
+// ৩. লাইভ সার্চ (Tavily + আনলিমিটেড ফ্রি Google News RSS ব্যাকআপ)
+async function runLiveSearch(query, tavilyKeys) {
+  const tav429 = [];
+
+  for (let i = 0; i < tavilyKeys.length; i++) {
+    try {
+      const resp = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: tavilyKeys[i],
+          query,
+          search_depth: 'basic',
+          max_results: 4,
+          include_answer: true
+        }),
+        signal: AbortSignal.timeout(4500)
+      });
+
+      if (resp.status === 429 || resp.status === 432) {
+        tav429.push(i);
+        continue;
+      }
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+      let summary = '';
+      if (data.answer) summary += `Summary: ${data.answer}\n`;
+      if (Array.isArray(data.results)) {
+        for (const r of data.results.slice(0, 3)) {
+          summary += `- ${r.title}: ${String(r.content || '').slice(0, 220)}\n`;
+        }
+      }
+      if (summary.trim()) {
+        return { context: summary.trim(), source: 'tavily', tavIdx: i, tav429 };
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+
+  // ফ্রি আনলিমিটেড ব্যাকআপ: Google News RSS (কোনো কী লাগে না)
+  try {
+    const rssUrls = [
+      `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=bn&gl=BD&ceid=BD:bn`,
+      `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=BD&ceid=BD:en`
+    ];
+    for (const url of rssUrls) {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!resp.ok) continue;
+      const xml = await resp.text();
+      const items = [...xml.matchAll(/<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>[\s\S]*?<pubDate>([\s\S]*?)<\/pubDate>[\s\S]*?<\/item>/g)];
+      if (items.length > 0) {
+        const lines = items.slice(0, 5).map((m) => {
+          const title = m[1].replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+          const pub = m[2].trim();
+          return `- ${title} (${pub})`;
+        });
+        return { context: lines.join('\n'), source: 'rss', tavIdx: -1, tav429 };
+      }
+    }
+  } catch (_) {}
+
+  return { context: '', source: 'none', tavIdx: -1, tav429 };
+}
+
+// ৪. সিস্টেম প্রম্পট (তুমি/বলো টোন, ইমবট/আল ইমরান, ৫-স্লট স্মার্ট অ্যালার্ম, ৯০০ টোকেন)
+function buildSystemPrompt(timeInfo, status, searchContext) {
+  return `You are IMBOT (ইমবট), a smart, warm, accurate Bangla desktop AI robot created by Al Imran (আল ইমরান).
+
+IDENTITY & TONE RULES:
+1) Your name is ইমবট (IMBOT). If asked who made/built/created you, answer: আমাকে আল ইমরান বানিয়েছেন।
+2) Always speak in natural, friendly, conversational Bangla using "তুমি / বলো" (like a helpful close peer). NEVER use formal "আপনি / বলুন" and NEVER use the words "বাডি" or "বন্ধু".
+3) Be accurate, serious, and direct for commands and factual questions. For stories, riddles (ধাঁধা), or jokes, be lively and complete the full story/riddle naturally without cutting it short.
+4) Never output markdown symbols (*, #, **, backticks). Output plain clean Bangla speech text after the tag.
+5) Current Dhaka Date & Time: ${timeInfo.full}. Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}.
+6) Device Status: City=${status.city}, Weather=${status.weather}, Battery=${status.bat}, Volume=${status.vol}%.
+${searchContext ? `\nLIVE WEB SEARCH RESULTS (TRUST THIS OVER OLD KNOWLEDGE FOR CURRENT EVENTS/PRICES/LEADERS):\n${searchContext}\n` : ''}
+COMMAND TAGS (Put the EXACT tag at the very start ONLY when the user gives a command, followed by a brief 3-7 word friendly Bangla confirmation):
+- [ACT:ALARM:YYYY-MM-DD:HH:MM:ONCE] set one-time alarm on specific date (24h HH:MM). Use Today=${timeInfo.dateStr} for আজ/আজকে, Tomorrow=${timeInfo.tomorrowStr} for কাল/কালকে, or exact date for "৩০ তারিখ". সকাল=AM, দুপুর/বিকাল/সন্ধ্যা/রাত=PM (রাত ১২টা=00:00).
+- [ACT:ALARM:DAILY:HH:MM:DAILY] set repeating daily alarm ONLY if user says প্রতিদিন/রোজ/daily.
+- [ACT:ALARM:OFF] cancel all alarms (সব অ্যালার্ম বন্ধ করো).
+- [ACT:ALARM:DEL:HH:MM] delete a specific alarm time.
+- [ACT:VOL:UP] increase volume, [ACT:VOL:DOWN] decrease volume, [ACT:VOL:MAX] max volume, [ACT:VOL:LOW] low volume.
+- [ACT:GAMES] open games menu, [ACT:GAME:TTT] Tic-Tac-Toe, [ACT:GAME:RPS] Rock Paper Scissors, [ACT:GAME:DINO] Dino Run, [ACT:GAME:FLAPPY] Flappy, [ACT:GAME:COIN] Coin Toss.
+- [ACT:CLOCK] show/tell time, [ACT:WEATHER] show/tell weather, [ACT:INTRO] play intro.
+- [ACT:TIMER:SECONDS] start timer in seconds, [ACT:TIMER:OFF] stop timer.
+- [ACT:FOCUS:MINUTES] start focus (default 25), [ACT:FOCUS:OFF] stop focus.
+- [ACT:TEXT:SHORT ENGLISH TEXT] scroll text on OLED.
+- [ACT:SLEEP] go to sleep.
+
+If NOT a command, start with ONE matching emotion tag: [HAPPY], [LAUGH], [LOVE], [SHY], [WINK], [AMAZED], [SHOCKED], [CONFUSED], [ANGRY], [SAD], [COOL], [HOT], [SHIVER], or [DIZZY], then give the Bangla answer directly.`;
+}
+
+// ৫. Gemini API কল (মাল্টি-কী ও মডেল ফলব্যাক)
+async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
+  const gem429 = [];
+  const models = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+
+  for (let i = 0; i < geminiKeys.length; i++) {
+    for (const model of models) {
+      try {
+        const parts = wavBuffer
+          ? [
+              { inline_data: { mime_type: 'audio/wav', data: wavBuffer.toString('base64') } },
+              { text: sysPrompt }
+            ]
+          : [{ text: `${sysPrompt}\n\nUser says: ${userText}` }];
+
+        const resp = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKeys[i]}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts }],
+              generationConfig: { maxOutputTokens: 900, temperature: 0.35 }
+            }),
+            signal: AbortSignal.timeout(8500)
+          }
+        );
+
+        if (resp.status === 429) {
+          if (!gem429.includes(i)) gem429.push(i);
+          break; // পরের Gemini কী-তে যাও
+        }
+        if (!resp.ok) continue;
+
+        const data = await resp.json();
+        const text = (data?.candidates?.[0]?.content?.parts || [])
+          .map((p) => p.text || '')
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (text) return { reply: text, gemIdx: i, gem429 };
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+  return { reply: '', gemIdx: -1, gem429 };
+}
+
+// ৬. Groq Llama 3.3 70B ব্যাকআপ AI (Gemini 429 হলে অটো চলবে)
+async function askGroqLLM(sysPrompt, userText, groqKeys, existing429) {
+  const groq429 = [...existing429];
+  for (let i = 0; i < groqKeys.length; i++) {
+    if (groq429.includes(i)) continue;
+    try {
+      const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${groqKeys[i]}`
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            { role: 'system', content: sysPrompt },
+            { role: 'user', content: userText }
+          ],
+          max_tokens: 900,
+          temperature: 0.35
+        }),
+        signal: AbortSignal.timeout(8000)
+      });
+
+      if (resp.status === 429) {
+        groq429.push(i);
+        continue;
+      }
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+      const text = String(data?.choices?.[0]?.message?.content || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (text) return { reply: text, groqIdx: i, groq429 };
+    } catch (_) {
+      continue;
+    }
+  }
+  return { reply: '', groqIdx: -1, groq429 };
+}
+
+async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const timeInfo = getDhakaTimeInfo();
+
+  if (req.method === 'GET') {
+    return res.status(200).send(
+      JSON.stringify({
+        ok: true,
+        status: 'IMBOT Cloud Brain Online',
+        version: '2.0',
+        dhaka_time: timeInfo.full
+      })
+    );
+  }
+
+  if (req.method !== 'POST') {
+    return res.status(405).send(JSON.stringify({ ok: false, reply: 'Method Not Allowed' }));
+  }
+
+  try {
+    const mode = String(req.headers['x-mode'] || 'text').toLowerCase();
+    const geminiKeys = parseKeys(req.headers['x-gemini-keys']);
+    const groqKeys = parseKeys(req.headers['x-groq-keys']);
+    const tavilyKeys = parseKeys(req.headers['x-tavily-keys']);
+
+    const status = {
+      city: String(req.headers['x-city'] || 'Dhaka'),
+      weather: String(req.headers['x-weather'] || 'Unknown'),
+      bat: String(req.headers['x-bat'] || 'Unknown'),
+      vol: String(req.headers['x-vol'] || '95')
+    };
+
+    const rawBody = await readRawBody(req);
+    let userText = '';
+    let sttGroqIdx = -1;
+    let groq429 = [];
+    let fallbackWav = null;
+
+    if (mode === 'audio') {
+      if (groqKeys.length > 0) {
+        const stt = await transcribeWithGroq(rawBody, groqKeys);
+        userText = stt.text;
+        sttGroqIdx = stt.groqIdx;
+        groq429 = stt.groq429;
+      }
+      if (!userText && geminiKeys.length > 0) {
+        fallbackWav = rawBody; // Groq না থাকলে বা ফেইল করলে Gemini সরাসরি অডিও শুনবে
+      }
+      if (!userText && !fallbackWav) {
+        return res.status(200).send(
+          JSON.stringify({
+            ok: false,
+            transcript: '',
+            reply: '[CONFUSED] কথাটা পরিষ্কার শুনতে পাইনি, আরেকবার বলো তো।',
+            engine: 'none',
+            gemIdx: -1,
+            groqIdx: sttGroqIdx,
+            tavIdx: -1,
+            search: 'none',
+            gem429: [],
+            groq429,
+            tav429: []
+          })
+        );
+      }
+    } else {
+      userText = rawBody.toString('utf8').trim();
+    }
+
+    // লাইভ ওয়েব সার্চ (শুধু প্রয়োজন হলে)
+    let searchRes = { context: '', source: 'none', tavIdx: -1, tav429: [] };
+    if (userText && needsLiveSearch(userText)) {
+      searchRes = await runLiveSearch(userText, tavilyKeys);
+    }
+
+    const sysPrompt = buildSystemPrompt(timeInfo, status, searchRes.context);
+
+    let reply = '';
+    let engine = 'none';
+    let gemIdx = -1;
+    let gem429 = [];
+    let finalGroqIdx = sttGroqIdx;
+
+    // প্রথমে Gemini চেষ্টা করবে
+    if (geminiKeys.length > 0) {
+      const g = await askGemini(sysPrompt, userText, fallbackWav, geminiKeys);
+      reply = g.reply;
+      gemIdx = g.gemIdx;
+      gem429 = g.gem429;
+      if (reply) engine = 'gemini';
+    }
+
+    // Gemini 429 বা ফেইল করলে সাথে সাথে Groq Llama 3.3 70B উত্তর দেবে
+    if (!reply && userText && groqKeys.length > 0) {
+      const q = await askGroqLLM(sysPrompt, userText, groqKeys, groq429);
+      reply = q.reply;
+      if (q.groqIdx !== -1) finalGroqIdx = q.groqIdx;
+      groq429 = q.groq429;
+      if (reply) engine = 'groq';
+    }
+
+    if (!reply) {
+      reply = '[SAD] সবগুলো এপিআই কী-এর লিমিট শেষ বা সার্ভার ব্যস্ত, ওয়েব হাবে নতুন কী দাও।';
+    }
+
+    return res.status(200).send(
+      JSON.stringify({
+        ok: engine !== 'none',
+        transcript: userText,
+        reply,
+        engine,
+        gemIdx,
+        groqIdx: finalGroqIdx,
+        tavIdx: searchRes.tavIdx,
+        search: searchRes.source,
+        gem429,
+        groq429,
+        tav429: searchRes.tav429
+      })
+    );
+  } catch (err) {
+    return res.status(500).send(
+      JSON.stringify({
+        ok: false,
+        transcript: '',
+        reply: '[SAD] সার্ভার সাময়িক সমস্যায় আছে, আরেকবার চেষ্টা করো।',
+        error: String(err && err.message ? err.message : err)
+      })
+    );
+  }
+}
+
+module.exports = handler;
+module.exports.config = { api: { bodyParser: false } };
