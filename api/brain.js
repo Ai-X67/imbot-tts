@@ -1,4 +1,4 @@
-// IMBOT Cloud Engine v2.2 — 16kHz u-Law + Multi-Model Gemini/Groq Fallback + 2026 Smart Search
+// IMBOT Cloud Engine v2.3 — Conversation Memory + Strict Identity + Clean u-Law + 2026 Smart Search
 
 const parseKeys = (headerVal) =>
   String(headerVal || '')
@@ -39,6 +39,15 @@ async function readRawBody(req, isAudio) {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+function decodeHistoryHeader(hdrVal) {
+  if (!hdrVal) return '';
+  try {
+    return Buffer.from(String(hdrVal).trim(), 'base64').toString('utf8').trim().slice(0, 1500);
+  } catch (_) {
+    return '';
+  }
 }
 
 function muLawToLinear(uVal) {
@@ -83,7 +92,7 @@ function normalizeToCleanPcmWav(rawBuf) {
   let activeCnt = 0;
   for (let i = skip; i < samples.length; i++) {
     const v = samples[i];
-    if (Math.abs(v) > 120) {
+    if (Math.abs(v) > 90) {
       sumSq += v * v;
       activeCnt++;
     }
@@ -91,9 +100,9 @@ function normalizeToCleanPcmWav(rawBuf) {
 
   if (activeCnt > 200) {
     const rms = Math.sqrt(sumSq / activeCnt);
-    if (rms > 60) {
-      let gain = 4600 / rms;
-      if (gain > 8.0) gain = 8.0;
+    if (rms > 45) {
+      let gain = 4800 / rms;
+      if (gain > 10.0) gain = 10.0;
       if (gain < 0.7) gain = 0.7;
       for (let i = 0; i < samples.length; i++) {
         const scaled = (samples[i] * gain) / 30000;
@@ -140,7 +149,7 @@ async function transcribeWithGroq(cleanWavBuf, groqKeys) {
         form.append('temperature', '0');
         form.append(
           'prompt',
-          'ইমবট, আল ইমরান, অ্যালার্ম, টাইমার, ফোকাস, গেম, টিক ট্যাক টো, রক পেপার সিজার, ডাইনো, ফ্ল্যাপি, কয়েন টস, ভলিউম, আবহাওয়া, সময়, বর্তমান প্রধানমন্ত্রী, তারেক রহমান, আইফোন ১৭ প্রো ম্যাক্স, বাংলাদেশের দাম কত, ঢাকা, বাংলাদেশ।'
+          'ইমবট, আল ইমরান, গল্প শোনাও, ধাঁধা বলো, অ্যালার্ম দাও, টাইমার, ফোকাস, গেম, ভলিউম, আবহাওয়া, সময়, বর্তমান প্রধানমন্ত্রী, তারেক রহমান, আইফোন ১৭ প্রো ম্যাক্স, দাম কত, ঢাকা, বাংলাদেশ।'
         );
 
         const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
@@ -170,22 +179,33 @@ async function transcribeWithGroq(cleanWavBuf, groqKeys) {
   return { text: '', groqIdx: -1, groq429 };
 }
 
-// ২. স্মার্ট লাইভ সার্চ ডিটেক্টর
-function needsLiveSearch(text) {
+// ২. স্মার্ট লাইভ সার্চ ডিটেক্টর (ফলো-আপ কারেকশনসহ)
+const LIVE_TRIGGERS = /(আজ|আজকে|এখন|বর্তমান|বত্তমান|সর্বশেষ|লেটেস্ট|নিউজ|খবর|দাম|হিদাম|প্রাইস|টাকা|প্রধানমন্ত্রী|রাষ্ট্রপতি|উপদেষ্টা|সরকার|নির্বাচন|খেলা|ম্যাচ|স্কোর|ক্রিকেট|ফুটবল|বিশ্বকাপ|আইফোন|iphone|samsung|ডলার|সোনা|স্বর্ণ|বাজারে|নতুন|আপডেট|মারা|বেঁচে|বাজেট|2025|2026|2027|১৭|17|price|latest|news|current|today|now|prime minister|president|score|match|winner|who is)/i;
+
+function needsLiveSearch(text, historyText) {
   const t = String(text || '').trim();
   if (!t) return false;
   const skipLocal = /(অ্যালার্ম|এলার্ম|alarm|টাইমার|timer|ফোকাস|focus|ভলিউম|সাউন্ড|volume|গেম|game|টিক ট্যাক|রক পেপার|ডাইনো|ফ্ল্যাপি|কয়েন|কয়েন|ঘুমা|sleep|ইন্ট্রো|intro|তোমার নাম|কে বানিয়েছে|বানাইছে|নির্মাতা|মেকার|ধাঁধা|গল্প|জোকস|কৌতুক)/i;
   if (skipLocal.test(t)) return false;
 
-  const liveTriggers = /(আজ|আজকে|এখন|বর্তমান|বত্তমান|সর্বশেষ|লেটেস্ট|নিউজ|খবর|দাম|হিদাম|প্রাইস|টাকা|প্রধানমন্ত্রী|রাষ্ট্রপতি|উপদেষ্টা|সরকার|নির্বাচন|খেলা|ম্যাচ|স্কোর|ক্রিকেট|ফুটবল|বিশ্বকাপ|আইফোন|iphone|samsung|ডলার|সোনা|স্বর্ণ|বাজারে|নতুন|আপডেট|মারা|বেঁচে|বাজেট|2025|2026|2027|১৭|17|price|latest|news|current|today|now|prime minister|president|score|match|winner|who is)/i;
-  return liveTriggers.test(t);
+  if (LIVE_TRIGGERS.test(t)) return true;
+
+  const followUpCue = /(না|নাই|বলি নাই|বলছি|বলেছি|ওটা|সেটা|এটা|ওর|তার|কত|আবার)/i;
+  if (historyText && followUpCue.test(t) && LIVE_TRIGGERS.test(historyText)) {
+    return true;
+  }
+  return false;
 }
 
-// ৩. বাংলা প্রশ্ন (ফোনেটিক টাইপোসহ) -> ২০২৬ ইংরেজি সার্চ কোয়েরি
-async function build2026SearchQuery(userText, timeInfo, groqKeys, existing429) {
+// ৩. কনভারসেশন হিস্ট্রিসহ ২০২৬ ইংরেজি সার্চ কোয়েরি তৈরি
+async function build2026SearchQuery(userText, historyText, timeInfo, groqKeys, existing429) {
   for (let i = 0; i < groqKeys.length; i++) {
     if (existing429.includes(i)) continue;
     try {
+      const promptInput = historyText
+        ? `Recent conversation:\n${historyText}\n\nLatest user message: ${userText}`
+        : userText;
+
       const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -197,11 +217,11 @@ async function build2026SearchQuery(userText, timeInfo, groqKeys, existing429) {
           messages: [
             {
               role: 'system',
-              content: `Today is ${timeInfo.dateStr} (year ${timeInfo.year}). Input is noisy Bangla speech-to-text (may have phonetic typos like "রহমাক্স"=Pro Max, "হিদাম"=দাম/price, "বত্তমানে"=বর্তমানে). Infer the real question and output ONLY ONE short English web search query (max 8 words) including "${timeInfo.year}". Include "Bangladesh" if relevant.`
+              content: `Today is ${timeInfo.dateStr} (year ${timeInfo.year}). Using the recent conversation context if the user is correcting or following up, convert the latest message (may have Bangla STT typos) into ONE short English web search query (max 8 words) including "${timeInfo.year}". Include "Bangladesh" if relevant. Output ONLY the query text.`
             },
-            { role: 'user', content: userText }
+            { role: 'user', content: promptInput }
           ],
-          max_tokens: 30,
+          max_tokens: 32,
           temperature: 0
         }),
         signal: AbortSignal.timeout(2500)
@@ -287,19 +307,21 @@ async function runLiveSearch(searchQuery, rawBangla, timeInfo, tavilyKeys) {
   return { context: '', source: 'none', tavIdx: -1, tav429 };
 }
 
-// ৫. সিস্টেম প্রম্পট
-function buildSystemPrompt(timeInfo, status, searchContext) {
-  return `You are IMBOT (ইমবট), a smart, accurate Bangla desktop AI robot created by Al Imran (আল ইমরান).
+// ৫. সিস্টেম প্রম্পট (কঠোর নাম/নির্মাতা নিয়ম + কনভারসেশন মেমোরি)
+function buildSystemPrompt(timeInfo, status, searchContext, historyText) {
+  return `You are IMBOT (ইমবট), a smart, accurate Bangla desktop AI robot.
 
-IDENTITY & TONE RULES:
-1) Your name is ইমবট (IMBOT). If asked who made/built/created you, answer: আমাকে আল ইমরান বানিয়েছেন।
-2) Always speak in natural, friendly, conversational Bangla using "তুমি / বলো". NEVER use formal "আপনি / বলুন" and NEVER use the words "বাডি" or "বন্ধু".
-3) User input may come from Bangla speech-to-text with minor phonetic typos (e.g. "আসকে তারিক"=আজকে তারিখ, "রহমাক্সের হিদাম"=প্রো ম্যাক্সের দাম). Understand the intended meaning seamlessly without mentioning typos.
-4) Be accurate and direct for commands and factual questions. For stories, riddles (ধাঁধা), or jokes, be lively and complete them fully.
-5) Never output markdown symbols (*, #, **, backticks). Output plain clean Bangla speech text after the tag.
-6) Current Dhaka Date & Time: ${timeInfo.full}. Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}, Current Year=${timeInfo.year}.
-7) Device Status: City=${status.city}, Weather=${status.weather}, Battery=${status.bat}, Volume=${status.vol}%.
-${searchContext ? `\nCRITICAL LIVE WEB SEARCH RESULTS (${timeInfo.year}):\nTrust these ${timeInfo.year} live results over any older knowledge. State the latest ${timeInfo.year} facts clearly in Bangla:\n${searchContext}\n` : ''}
+STRICT IDENTITY & TONE RULES:
+1) Your name is ইমবট (IMBOT). If asked your name (e.g. "তোমার নাম কী"), reply ONLY with your name like "আমার নাম ইমবট।" — NEVER mention your creator unless explicitly asked.
+2) ONLY if explicitly asked who made/created/built you (e.g. "তোমাকে কে বানিয়েছে", "তোমার নির্মাতা কে", "মেকার কে"), answer: আমাকে আল ইমরান বানিয়েছেন।
+3) Always speak in natural, friendly, conversational Bangla using "তুমি / বলো". NEVER use formal "আপনি / বলুন" and NEVER use the words "বাডি" or "বন্ধু".
+4) User input may come from Bangla speech-to-text with minor phonetic typos. Infer the intended meaning naturally without pointing out typos.
+5) Remember the recent conversation below so follow-up questions and corrections work seamlessly.
+6) For commands and facts, be accurate and direct. For stories, riddles (ধাঁধা), or jokes, give a complete, enjoyable answer in 3-5 smooth sentences.
+7) Never output markdown symbols (*, #, **, backticks). Output plain clean Bangla speech text after the tag.
+8) Current Dhaka Date & Time: ${timeInfo.full}. Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}, Current Year=${timeInfo.year}.
+9) Device Status: City=${status.city}, Weather=${status.weather}, Battery=${status.bat}, Volume=${status.vol}%.
+${historyText ? `\nRECENT CONVERSATION MEMORY (Continue naturally from this context):\n${historyText}\n` : ''}${searchContext ? `\nCRITICAL LIVE WEB SEARCH RESULTS (${timeInfo.year}):\nTrust these ${timeInfo.year} live results over any older knowledge. State the latest ${timeInfo.year} facts clearly in Bangla:\n${searchContext}\n` : ''}
 COMMAND TAGS (Put the EXACT tag at the very start ONLY when the user gives a command, followed by a brief 3-7 word friendly Bangla confirmation):
 - [ACT:ALARM:YYYY-MM-DD:HH:MM:ONCE] set one-time alarm on specific date (24h HH:MM). Today=${timeInfo.dateStr}, Tomorrow=${timeInfo.tomorrowStr}. সকাল=AM, দুপুর/বিকাল/সন্ধ্যা/রাত=PM (রাত ১২টা=00:00).
 - [ACT:ALARM:DAILY:HH:MM:DAILY] set repeating daily alarm ONLY if user says প্রতিদিন/রোজ/daily.
@@ -316,7 +338,7 @@ COMMAND TAGS (Put the EXACT tag at the very start ONLY when the user gives a com
 If NOT a command, start with ONE matching emotion tag: [HAPPY], [LAUGH], [LOVE], [SHY], [WINK], [AMAZED], [SHOCKED], [CONFUSED], [ANGRY], [SAD], [COOL], [HOT], [SHIVER], or [DIZZY], then give the Bangla answer directly.`;
 }
 
-// ৬. Gemini API (বেশি কোটার lite প্রথমে, ৪২৯ এলে পরের মডেল স্কিপ করবে না)
+// ৬. Gemini API
 async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
   const gem429 = [];
   const models = ['gemini-flash-lite-latest', 'gemini-flash-latest'];
@@ -349,7 +371,7 @@ async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
         if (resp.status === 429) {
           hit429++;
           lastErr = '429';
-          continue; // একই কী-তে পরের Gemini মডেল ট্রাই করো
+          continue;
         }
         if (!resp.ok) {
           lastErr = String(resp.status);
@@ -374,7 +396,7 @@ async function askGemini(sysPrompt, userText, wavBuffer, geminiKeys) {
   return { reply: '', gemIdx: -1, gem429, lastErr };
 }
 
-// ৭. Groq Multi-Model ব্যাকআপ AI (৩টা মডেল অটো ফলব্যাক)
+// ৭. Groq Multi-Model ব্যাকআপ AI
 async function askGroqLLM(sysPrompt, userText, groqKeys, existing429) {
   const groq429 = [...existing429];
   const models = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b'];
@@ -444,7 +466,7 @@ async function handler(req, res) {
       JSON.stringify({
         ok: true,
         status: 'IMBOT Online',
-        version: '2.2',
+        version: '2.3',
         dhaka_time: timeInfo.full
       })
     );
@@ -460,6 +482,7 @@ async function handler(req, res) {
     const geminiKeys = parseKeys(req.headers['x-gemini-keys']);
     const groqKeys = parseKeys(req.headers['x-groq-keys']);
     const tavilyKeys = parseKeys(req.headers['x-tavily-keys']);
+    const historyText = decodeHistoryHeader(req.headers['x-history']);
 
     const status = {
       city: String(req.headers['x-city'] || 'Dhaka'),
@@ -507,12 +530,12 @@ async function handler(req, res) {
     }
 
     let searchRes = { context: '', source: 'none', tavIdx: -1, tav429: [] };
-    if (userText && needsLiveSearch(userText)) {
-      const smartQuery = await build2026SearchQuery(userText, timeInfo, groqKeys, groq429);
+    if (userText && needsLiveSearch(userText, historyText)) {
+      const smartQuery = await build2026SearchQuery(userText, historyText, timeInfo, groqKeys, groq429);
       searchRes = await runLiveSearch(smartQuery, userText, timeInfo, tavilyKeys);
     }
 
-    const sysPrompt = buildSystemPrompt(timeInfo, status, searchRes.context);
+    const sysPrompt = buildSystemPrompt(timeInfo, status, searchRes.context, historyText);
 
     let reply = '';
     let engine = 'none';
